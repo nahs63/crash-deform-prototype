@@ -1,7 +1,3 @@
-// VehicleCrashPhysics.cpp
-// Simplified vehicle impact & deformation simulation
-// Inspired by RAGE vehicle damage system (phInst + fragment deformation + crush zones)
-// For prototyping / mod research only
 
 #include <iostream>
 #include <cmath>
