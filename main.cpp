@@ -1,9 +1,15 @@
+// VehicleCrashPhysics.cpp
+// Simplified vehicle impact & deformation simulation
+// Using RAGE-style physics hooks (phInst-inspired impulse, fragment deformation, crush zones)
+// Prototype for RAGE engine vehicle damage research — not actual engine code
 
 #include <iostream>
 #include <cmath>
 #include <random>
 #include <chrono>
 #include <thread>
+
+namespace rage {
 
 struct Vec3 {
     float x = 0.0f;
@@ -33,95 +39,97 @@ struct Vec3 {
     }
 };
 
-struct VehicleDamageState {
-    Vec3 position;          // world-space root position (~CoM)
+struct phVehicleDamage {
+    Vec3 position;          // fwEntity root pos (~CoM)
     Vec3 linearVel;         // m/s
     Vec3 angularVel;        // rad/s
 
-    // Local basis (simplified — real RAGE would use full matrix/quat)
+    // Local basis (simplified from rage::Matrix34)
     Vec3 forward {0.0f, 1.0f, 0.0f};
     Vec3 right   {1.0f, 0.0f, 0.0f};
     Vec3 up      {0.0f, 0.0f, 1.0f};
 
-    float mass = 1450.0f;   // kg, approximate mid-size sedan
+    float mass = 1450.0f;   // from handling.meta approx
 
-    // Diagonal inertia tensor approximation (kg·m²)
+    // Diagonal inertia tensor (phInst style)
     Vec3 inertiaTensor {1400.0f, 2600.0f, 2200.0f};
 
-    // Per-zone crush deformation (0.0 → 1.0)
-    float crushZones[6] = {0};  // 0:front, 1:rear, 2:left, 3:right, 4:roof, 5:floor
+    // Deformation scalars (like SET_VEHICLE_DAMAGE zones)
+    float deformZones[6] = {0};  // 0:front, 1:rear, 2:left, 3:right, 4:roof, 5:floor
 
-    // Detached/broken components
-    bool detached[8] = {false}; // 0–3:wheels, 4–5:doors, 6:hood, 7:trunk
+    // Fragment states (detached flags)
+    bool fragmentDetached[8] = {false}; // 0–3:wheels, 4–5:doors, 6:hood, 7:trunk
 };
 
-namespace Physics {
+namespace phInst {
 
-void ApplyImpulse(VehicleDamageState& veh, const Vec3& worldImpactPos, const Vec3& impulse) {
-    Vec3 r = worldImpactPos - veh.position;  // lever arm from CoM
+void ApplyImpulse(phVehicleDamage& veh, const Vec3& worldImpactPos, const Vec3& impulse) {
+    Vec3 r = worldImpactPos - veh.position;  // offset from CoM
 
-    // Linear momentum change
+    // phLinear momentum update
     veh.linearVel = veh.linearVel + impulse * (1.0f / veh.mass);
 
-    // Angular momentum change
+    // phAngular momentum
     Vec3 angularImpulse = r.cross(impulse);
     veh.angularVel.x += angularImpulse.x / veh.inertiaTensor.x;
     veh.angularVel.y += angularImpulse.y / veh.inertiaTensor.y;
     veh.angularVel.z += angularImpulse.z / veh.inertiaTensor.z;
 }
 
-void ProcessDeformation(VehicleDamageState& veh, const Vec3& localImpactPos, float impactEnergy) {
-    // Very approximate zone classification
-    const float frontThreshold =  0.65f;
-    const float rearThreshold  = -0.65f;
-    const float sideThreshold  =  0.85f;
+void ProcessDeformation(phVehicleDamage& veh, const Vec3& localImpactPos, float impactEnergy) {
+    // Approximate zone mapping (RAGE vehicle archetype deform)
+    const float frontThresh =  0.65f;
+    const float rearThresh  = -0.65f;
+    const float sideThresh  =  0.85f;
 
-    float dmg = impactEnergy * 0.00042f;  // tuned empirically for ~100 km/h wall ≈ 40–60% front crush
+    float dmg = impactEnergy * 0.00042f;  // scaled like deformationMult
 
-    if (localImpactPos.y > frontThreshold) {
-        veh.crushZones[0] = std::min(veh.crushZones[0] + dmg * 1.35f, 1.0f);
+    if (localImpactPos.y > frontThresh) {
+        veh.deformZones[0] = std::min(veh.deformZones[0] + dmg * 1.35f, 1.0f);
     }
-    if (localImpactPos.y < rearThreshold) {
-        veh.crushZones[1] = std::min(veh.crushZones[1] + dmg * 1.10f, 1.0f);
+    if (localImpactPos.y < rearThresh) {
+        veh.deformZones[1] = std::min(veh.deformZones[1] + dmg * 1.10f, 1.0f);
     }
-    if (std::abs(localImpactPos.x) > sideThreshold) {
+    if (std::abs(localImpactPos.x) > sideThresh) {
         int side = (localImpactPos.x > 0.0f) ? 3 : 2;
-        veh.crushZones[side] = std::min(veh.crushZones[side] + dmg * 1.45f, 1.0f);
+        veh.deformZones[side] = std::min(veh.deformZones[side] + dmg * 1.45f, 1.0f);
     }
 
-    // Small chance of component failure on high-energy hits
+    // Fragment break chance (high energy threshold)
     if (impactEnergy > 220000.0f && (rand() % 100) < 28) {
-        int partIdx = rand() % 8;
-        if (!veh.detached[partIdx]) {
-            veh.detached[partIdx] = true;
-            std::cout << "[Damage] Component " << partIdx << " detached\n";
+        int fragIdx = rand() % 8;
+        if (!veh.fragmentDetached[fragIdx]) {
+            veh.fragmentDetached[fragIdx] = true;
+            std::cout << "[phFragment] Detached index " << fragIdx << "\n";
         }
     }
 }
 
-void Integrate(VehicleDamageState& veh, float dt) {
-    // Simple angular damping (prevents infinite spinning)
+void Integrate(phVehicleDamage& veh, float dt) {
+    // Angular damping (phDampening param)
     veh.angularVel = veh.angularVel * 0.965f;
 
-    // Position update
+    // fwEntity position integrate
     veh.position = veh.position + veh.linearVel * dt;
 
-    // Basic ground plane + air drag
+    // Simple ground + drag (no full phCollider)
     if (veh.position.z < 0.45f) veh.position.z = 0.45f;
     veh.linearVel = veh.linearVel * 0.991f;
-    veh.linearVel.z -= 9.81f * dt * 0.35f;  // softened gravity
+    veh.linearVel.z -= 9.81f * dt * 0.35f;  // gravity scalar
 }
 
-} // namespace Physics
+} // namespace phInst
+
+} // namespace rage
 
 int main() {
     std::srand(static_cast<unsigned>(std::time(nullptr)));
 
-    VehicleDamageState car;
+    rage::phVehicleDamage car;
     car.position    = {0.0f, 0.0f, 0.75f};
-    car.linearVel   = {0.0f, 31.0f, 0.8f};  // ~112 km/h with slight upward component
+    car.linearVel   = {0.0f, 31.0f, 0.8f};  // ~112 km/h forward
 
-    std::cout << "Crash test started — initial speed: "
+    std::cout << "RAGE vehicle test — initial speed: "
               << car.linearVel.length() * 3.6f << " km/h\n\n";
 
     const float wallX = 38.0f;
@@ -129,35 +137,35 @@ int main() {
     float simTime = 0.0f;
 
     while (simTime < 5.0f) {
-        // Detect approximate front impact
+        // Simulate front collision (no real phCollider query)
         if (car.position.x > wallX - 2.4f && car.linearVel.x > 1.5f) {
-            std::cout << "\n=== Wall impact detected @ " << simTime << " s ===\n";
+            std::cout << "\n=== phImpact detected @ " << simTime << " s ===\n";
 
-            Vec3 localImpact {0.2f, 2.1f, 0.4f};           // front-right bumper area
-            Vec3 worldImpact = car.position + localImpact;
+            rage::Vec3 localImpact {0.2f, 2.1f, 0.4f};  // front-right
+            rage::Vec3 worldImpact = car.position + localImpact;
 
-            Vec3 wallNormal {-1.0f, 0.0f, 0.0f};
+            rage::Vec3 wallNormal {-1.0f, 0.0f, 0.0f};
 
             float closingSpeed = car.linearVel.dot(wallNormal);
             if (closingSpeed < -0.4f) {
-                float restitution = 0.16f;  // low — most energy absorbed
+                float restitution = 0.16f;  // inelastic
                 float impulseMag = -(1.0f + restitution) * closingSpeed * car.mass * 0.78f;
 
-                Vec3 impulse = wallNormal * impulseMag;
+                rage::Vec3 impulse = wallNormal * impulseMag;
 
-                Physics::ApplyImpulse(car, worldImpact, impulse);
+                rage::phInst::ApplyImpulse(car, worldImpact, impulse);
                 float approxKE = 0.5f * car.mass * car.linearVel.length() * car.linearVel.length();
-                Physics::ProcessDeformation(car, localImpact, approxKE);
+                rage::phInst::ProcessDeformation(car, localImpact, approxKE);
 
-                std::cout << "  Front crush: " << (car.crushZones[0] * 100.0f) << "%\n";
-                std::cout << "  Right crush: " << (car.crushZones[3] * 100.0f) << "%\n";
+                std::cout << "  Front deform: " << (car.deformZones[0] * 100.0f) << "%\n";
+                std::cout << "  Right deform: " << (car.deformZones[3] * 100.0f) << "%\n";
             }
         }
 
-        Physics::Integrate(car, dt);
+        rage::phInst::Integrate(car, dt);
         simTime += dt;
 
-        // Periodic status
+        // Status log
         static float lastReport = -1.0f;
         if (simTime - lastReport > 0.4f) {
             std::cout << simTime << " s | pos: " << car.position.x << ", " << car.position.y
@@ -166,6 +174,6 @@ int main() {
         }
     }
 
-    std::cout << "\nSimulation finished.\n";
+    std::cout << "\nRAGE sim finished.\n";
     return 0;
 }
